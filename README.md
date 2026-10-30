@@ -43,6 +43,13 @@ if _, err := db.Exec("CREATE TABLE my_table (n INT)"); err != nil
 }
 ```
 
+Transaction mode
+----------------
+
+Transactions use `BEGIN` by default. Construct the driver with
+`driver.WithBeginImmediate(true)` to use `BEGIN IMMEDIATE` instead.
+Configure writer waiting separately with `app.WithBusyTimeout`.
+
 Build
 -----
 

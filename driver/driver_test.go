@@ -16,11 +16,13 @@ package driver_test
 
 import (
 	"context"
+	"database/sql"
 	"database/sql/driver"
 	"io"
 	"io/ioutil"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -689,7 +691,7 @@ func Test_Dump(t *testing.T) {
 
 const bindAddress = "@1"
 
-func newDriver(t *testing.T) (*dqlitedriver.Driver, func()) {
+func newDriver(t *testing.T, opts ...dqlitedriver.Option) (*dqlitedriver.Driver, func()) {
 	t.Helper()
 
 	dir, dirCleanup := newDir(t)
@@ -699,7 +701,8 @@ func newDriver(t *testing.T) (*dqlitedriver.Driver, func()) {
 
 	log := logging.Test(t)
 
-	driver, err := dqlitedriver.New(store, dqlitedriver.WithLogFunc(log))
+	opts = append([]dqlitedriver.Option{dqlitedriver.WithLogFunc(log)}, opts...)
+	driver, err := dqlitedriver.New(store, opts...)
 	require.NoError(t, err)
 
 	cleanup := func() {
@@ -708,6 +711,115 @@ func newDriver(t *testing.T) (*dqlitedriver.Driver, func()) {
 	}
 
 	return driver, cleanup
+}
+
+func TestDriver_BeginImmediate(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		opts     []dqlitedriver.Option
+		busy     bool
+		readOnly bool
+		legacy   bool
+	}{
+		{name: "default"},
+		{name: "enabled", opts: []dqlitedriver.Option{dqlitedriver.WithBeginImmediate(true)}, busy: true},
+		{name: "disabled", opts: []dqlitedriver.Option{dqlitedriver.WithBeginImmediate(true), dqlitedriver.WithBeginImmediate(false)}},
+		{name: "read_only", opts: []dqlitedriver.Option{dqlitedriver.WithBeginImmediate(true)}, busy: true, readOnly: true},
+		{name: "legacy_begin", opts: []dqlitedriver.Option{dqlitedriver.WithBeginImmediate(true)}, busy: true, legacy: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			drv, cleanup := newDriver(t, tt.opts...)
+			defer cleanup()
+			connector, err := drv.OpenConnector("test.db")
+			require.NoError(t, err)
+			db := sql.OpenDB(connector)
+			defer db.Close()
+			db.SetMaxOpenConns(2)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_, err = db.ExecContext(ctx, "CREATE TABLE counter (n INT)")
+			require.NoError(t, err)
+			first, err := db.BeginTx(ctx, nil)
+			require.NoError(t, err)
+			defer first.Rollback()
+			_, err = first.ExecContext(ctx, "INSERT INTO counter VALUES (1)")
+			require.NoError(t, err)
+			var second *sql.Tx
+			if tt.legacy {
+				second, err = db.Begin()
+			} else {
+				second, err = db.BeginTx(ctx, &sql.TxOptions{ReadOnly: tt.readOnly})
+			}
+			if tt.busy {
+				var busy dqlitedriver.Error
+				require.ErrorAs(t, err, &busy)
+				assert.Equal(t, dqlitedriver.ErrBusy, busy.Code)
+			} else {
+				require.NoError(t, err)
+				require.NoError(t, second.Rollback())
+			}
+			require.NoError(t, first.Commit())
+		})
+	}
+}
+
+func TestDriver_BeginImmediateConcurrentUpdates(t *testing.T) {
+	dir, dirCleanup := newDir(t)
+	defer dirCleanup()
+	node, err := dqlite.New(1, bindAddress, dir,
+		dqlite.WithBindAddress(bindAddress), dqlite.WithBusyTimeout(2000))
+	require.NoError(t, err)
+	require.NoError(t, node.Start())
+	defer node.Close()
+	drv, err := dqlitedriver.New(newStore(t, bindAddress), dqlitedriver.WithBeginImmediate(true))
+	require.NoError(t, err)
+	connector, err := drv.OpenConnector("test.db")
+	require.NoError(t, err)
+	db := sql.OpenDB(connector)
+	defer db.Close()
+	db.SetMaxOpenConns(2)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err = db.ExecContext(ctx, "CREATE TABLE counter (n INT)")
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, "INSERT INTO counter VALUES (0)")
+	require.NoError(t, err)
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	var ready sync.WaitGroup
+	ready.Add(2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			ready.Done()
+			<-start
+			results <- incrementCounter(ctx, db)
+		}()
+	}
+	ready.Wait()
+	close(start)
+	for i := 0; i < 2; i++ {
+		require.NoError(t, <-results)
+	}
+	var value int
+	require.NoError(t, db.QueryRowContext(ctx, "SELECT n FROM counter").Scan(&value))
+	assert.Equal(t, 2, value)
+}
+
+func incrementCounter(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var value int
+	if err := tx.QueryRowContext(ctx, "SELECT n FROM counter").Scan(&value); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, "UPDATE counter SET n = ?", value+1); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // Create a new in-memory server store populated with the given addresses.

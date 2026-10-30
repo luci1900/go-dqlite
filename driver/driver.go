@@ -39,6 +39,7 @@ type Driver struct {
 	context               context.Context  // Global cancellation context
 	connectionTimeout     time.Duration    // Max time to wait for a new connection
 	contextTimeout        time.Duration    // Default client context timeout.
+	beginImmediate        bool             // Acquire the write lock when beginning a transaction.
 	clientConfig          protocol.Config  // Configuration for dqlite client instances
 	tracing               client.LogLevel  // Whether to trace statements
 	concurrentLeaderConns *int64           // Maximum number of concurrent connections to other cluster members while probing for leadership.
@@ -181,6 +182,19 @@ func WithContextTimeout(timeout time.Duration) Option {
 	}
 }
 
+// WithBeginImmediate makes transactions start with BEGIN IMMEDIATE instead of
+// BEGIN. This acquires the write lock before executing any transaction statements,
+// avoiding read-to-write upgrade conflicts. It also applies to transactions
+// requested with ReadOnly, which this driver does not currently enforce.
+//
+// The default is false. Configure the node's busy timeout separately to control
+// how long a transaction waits for another writer to release the lock.
+func WithBeginImmediate(enabled bool) Option {
+	return func(options *options) {
+		options.BeginImmediate = enabled
+	}
+}
+
 // WithTracing will emit a log message at the given level every time a
 // statement gets executed.
 func WithTracing(level client.LogLevel) Option {
@@ -204,6 +218,7 @@ func New(store client.NodeStore, options ...Option) (*Driver, error) {
 		context:               o.Context,
 		connectionTimeout:     o.ConnectionTimeout,
 		contextTimeout:        o.ContextTimeout,
+		beginImmediate:        o.BeginImmediate,
 		tracing:               o.Tracing,
 		concurrentLeaderConns: o.ConcurrentLeaderConns,
 		clientConfig: protocol.Config{
@@ -225,6 +240,7 @@ type options struct {
 	AttemptTimeout          time.Duration
 	ConnectionTimeout       time.Duration
 	ContextTimeout          time.Duration
+	BeginImmediate          bool
 	ConnectionBackoffFactor time.Duration
 	ConnectionBackoffCap    time.Duration
 	ConcurrentLeaderConns   *int64
@@ -267,6 +283,7 @@ func (c *Connector) Connect(ctx context.Context) (driver.Conn, error) {
 	conn := &Conn{
 		log:            c.driver.log,
 		contextTimeout: c.driver.contextTimeout,
+		beginImmediate: c.driver.beginImmediate,
 		tracing:        c.driver.tracing,
 	}
 
@@ -350,6 +367,7 @@ type Conn struct {
 	response       protocol.Message
 	id             uint32 // Database ID.
 	contextTimeout time.Duration
+	beginImmediate bool
 	tracing        client.LogLevel
 }
 
@@ -507,7 +525,11 @@ func (c *Conn) Close() error {
 // true to either set the read-only transaction property if supported or return
 // an error if it is not supported.
 func (c *Conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
-	if _, err := c.ExecContext(ctx, "BEGIN", nil); err != nil {
+	begin := "BEGIN"
+	if c.beginImmediate {
+		begin = "BEGIN IMMEDIATE"
+	}
+	if _, err := c.ExecContext(ctx, begin, nil); err != nil {
 		return nil, err
 	}
 
